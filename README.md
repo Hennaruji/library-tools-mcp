@@ -1,88 +1,155 @@
 # library-tools-mcp
 
-An MCP server that serves an indexed folder of markdown docs. One call returns
-many docs, with text, code blocks and images interleaved in document order.
+An MCP server that lets an agent browse an indexed markdown library and pull
+exactly the context it needs (whole docs, directory roots, sections, line
+ranges, or any mix) in one call. Text, code blocks and images come back
+interleaved in document order.
 
 ```
-guide_server.py      the server
-examples/guide/      sample docs (front matter, an image, code blocks)
-tests/smoke.py       end-to-end test over stdio
+library_server.py    the server
+library/             sample library (proof-of-concept data and conventions)
+tests/smoke.py       end-to-end test over stdio, one check per behaviour
 ```
 
-## Setup
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-python tests/smoke.py          # runs the server against examples/guide
+python tests/smoke.py        # -v prints every request and response
 ```
 
-To use it from another project, point `GUIDE_DIR` at that project's docs and
-register the server in the project's `.mcp.json`, so anyone who clones it gets it:
+Register it in a project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "guide": {
+    "library": {
       "command": "python",
-      "args": ["path/to/library-tools-mcp/guide_server.py"],
-      "env": { "GUIDE_DIR": "docs/guide" }
+      "args": ["path/to/library-tools-mcp/library_server.py"],
+      "env": { "LIBRARY_ROOT": "path/to/your/library" }
     }
   }
 }
 ```
 
-Requires version 2 of the Python MCP SDK (`mcp>=2`). Version 2 renamed `FastMCP`
-to `MCPServer`, so examples written for 1.x won't match this code exactly.
+Requires the v2 Python MCP SDK (`mcp>=2`, where `FastMCP` became `MCPServer`).
 
-## Docs
+## Library conventions
 
-Each `.md` file starts with front matter. `id` defaults to the filename and
-`description` is what the agent uses to choose docs, so make it say what
-questions the doc answers.
+These are proof-of-concept conventions. Swap in your real formats by changing
+`load_doc_index`, `load_image_index` and `IMAGE_STUB`; nothing else depends on them.
 
-```markdown
----
-id: auth
-title: Authentication
-description: Login flow, session tokens, SSO quirks
----
+```
+library/
+  index.json             document index
+  images/index.json      image index
+  images/*.png
+  guides/getting-started.md
+  backend/auth.md
+  backend/storage/caching.md
+  backend/storage/migrations.md
 ```
 
-Images are standard `![alt](relative/path.png)` references. The alt text becomes
-the caption the model sees, and the placeholder when images are left out.
+**Document index** (`index.json`): one entry per doc. Summaries and token
+counts are cached here; `path` is relative to the library root.
+
+```json
+{"documents": [
+  {"id": "auth", "path": "backend/auth.md", "title": "Authentication",
+   "summary": "Gateway token validation, login flow, ...", "approx_tokens": 353}
+]}
+```
+
+**Image index** (`images/index.json`): `file` is relative to the index's folder.
+
+```json
+{"images": [
+  {"id": "img-login-sequence", "file": "login-sequence.png",
+   "caption": "Login sequence: client, gateway, token service"}
+]}
+```
+
+**Image stubs** in markdown: `![[image:img-login-sequence]]`
+
+**Sections** are not cached. They are parsed from `#` headings on request
+(re-parsed only when a file changes):
+
+- A section id is its heading slug, nested with `/`: `refresh-tokens/rotation`.
+  A unique leaf (`rotation`) also works; an ambiguous one returns the candidates.
+- A doc with exactly one `#` heading treats it as the title. Its sections start
+  at `##`, and the text under the title is the `_intro` section.
+- Text before the first heading is `_preamble`.
+- Line numbers are the file's own 1-based lines, matching Read and grep.
+
+**Code** means fenced blocks (```` ``` ```` or `~~~`). Headings inside code
+blocks are ignored.
 
 ## Tools
 
-`list_documents()` returns the menu, with image and code-block counts per doc.
+### `list_documents(root=".", line_bounds=false, section_depth=null)`
 
-`get_documents(docs, include_images=False, include_code=True)`
+A tree from `root` (a directory relative to the library root), with doc
+summaries, token estimates and section outlines:
+
+```
+backend/storage/  (2 docs, ~351 tokens)
+
+- caching  [caching.md]  ~226 tokens  — Redis key conventions, invalidation ...
+    sections, 38 lines:
+      § _intro  ~34  L1–5  Caching
+      § key-conventions  ~43  L6–16  Key conventions
+      § invalidation  ~120  L17–34  Invalidation
+        § fan-out-deletes  ~98  L21–34  Fan-out deletes
+      § ttl-rules  ~28  L35–38  TTL rules
+```
+
+`line_bounds` adds the `L…` ranges; `section_depth` caps heading levels (0 = none).
+
+### `get_documents(select, include_images=false, include_code=true, max_tokens=50000)`
+
+`select` is a list. Each item is a doc id string or a selector object:
 
 ```jsonc
 {
-  "docs": [
-    "caching",                                   // uses the call-level settings
-    { "id": "auth", "include_images": true },    // per-doc override
-    { "id": "deploy", "include_code": false }
+  "select": [
+    "getting-started",                                       // whole doc
+    { "root": "backend/storage" },                           // every doc under a dir
+    { "doc": "auth", "sections": ["login-flow", "rotation"] },
+    { "doc": "auth", "lines": [43, 50] },
+    { "doc": "caching", "include_images": true }             // per-selector override
   ],
   "include_images": false,
   "include_code": true
 }
 ```
 
-Omitted code and images become one-line placeholders like
-`[code block omitted: python, 40 lines]`, so the model knows they exist and can
-fetch them on request. Images are off by default because they cost far more
-tokens than text.
-
-## Suggested CLAUDE.md line
-
-> The project guide is available through the `guide` MCP tools. Check
-> `list_documents`, then fetch everything relevant in ONE `get_documents` call.
-> Request images only for docs where the visual detail matters.
+- **Order:** output follows `select`; roots expand in path order.
+- **No repeats:** content already in the package is skipped and noted.
+- **Headers:** each chunk starts with `=== auth (backend/auth.md) · section rotation · L18–38 ===`.
+- **Placeholders:** omitted content becomes a one-line note, e.g.
+  `[code block omitted: python, 11 lines, L22–34]` or `[image omitted: img-fanout — caption]`.
+- **Code cuts:** a line range that starts or ends inside a code block gets its fences re-balanced.
+- **Budget:** if the estimate exceeds `max_tokens`, nothing is sent except an
+  itemized estimate so the agent can narrow the request. `null` = no limit.
+- **Errors:** unknown docs, sections or images are reported in a `Notes:` block
+  and don't fail the call. Only a malformed selector (e.g. both `doc` and `root`) is rejected.
 
 ## Settings
 
 | env var | default | meaning |
 |---|---|---|
-| `GUIDE_DIR` | `./guide` beside the script | docs root (images must live inside it) |
-| `GUIDE_MAX_IMAGE_BYTES` | 5 MB | larger images are replaced by a placeholder |
+| `LIBRARY_ROOT` | `./library` beside the script | library root |
+| `LIBRARY_DOC_INDEX` | `index.json` | doc index, relative to root |
+| `LIBRARY_IMAGE_INDEX` | `images/index.json` | image index, relative to root |
+| `LIBRARY_MAX_TOKENS` | `50000` | default `max_tokens` |
+| `LIBRARY_IMAGE_TOKENS` | `1500` | per-image estimate used for budgeting |
+| `LIBRARY_MAX_IMAGE_BYTES` | 5 MB | larger images become placeholders |
+
+Token estimates are ~4 characters per token: good for budgeting, not exact.
+
+## Suggested CLAUDE.md line
+
+> Project knowledge lives in the `library` MCP tools. Browse with
+> `list_documents`, then fetch everything relevant in ONE `get_documents` call,
+> mixing docs, roots, sections and line ranges as needed. Request images only
+> where the visual detail matters.

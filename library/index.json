@@ -1,0 +1,32 @@
+{
+  "documents": [
+    {
+      "id": "getting-started",
+      "path": "guides/getting-started.md",
+      "title": "Getting started",
+      "summary": "Local setup, dev stack, repository layout. Start here.",
+      "approx_tokens": 211
+    },
+    {
+      "id": "auth",
+      "path": "backend/auth.md",
+      "title": "Authentication",
+      "summary": "Gateway token validation, login flow, refresh-token rotation and expiry, SSO provider quirks.",
+      "approx_tokens": 353
+    },
+    {
+      "id": "caching",
+      "path": "backend/storage/caching.md",
+      "title": "Caching",
+      "summary": "Redis key conventions, invalidation after commit, fan-out deletes, TTL rules.",
+      "approx_tokens": 226
+    },
+    {
+      "id": "migrations",
+      "path": "backend/storage/migrations.md",
+      "title": "Migrations",
+      "summary": "Backwards-compatible schema changes: adding and dropping columns safely.",
+      "approx_tokens": 125
+    }
+  ]
+}
