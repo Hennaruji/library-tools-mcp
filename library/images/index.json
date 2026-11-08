@@ -1,0 +1,24 @@
+{
+  "images": [
+    {
+      "id": "img-service-map",
+      "file": "service-map.png",
+      "caption": "Dev stack: API, worker, Redis, Postgres and how they connect"
+    },
+    {
+      "id": "img-login-sequence",
+      "file": "login-sequence.png",
+      "caption": "Login sequence: client, gateway, token service"
+    },
+    {
+      "id": "img-token-rotation",
+      "file": "token-rotation.png",
+      "caption": "Refresh token family with one revoked token"
+    },
+    {
+      "id": "img-fanout",
+      "file": "fanout.png",
+      "caption": "Org change fanning out to member cache keys"
+    }
+  ]
+}
