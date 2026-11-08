@@ -1,0 +1,29 @@
+{
+  "documents": [
+    {
+      "id": "ok",
+      "path": "ok.md"
+    },
+    {
+      "path": "no-id.md"
+    },
+    {
+      "id": "abs",
+      "path": "/etc/hostname"
+    },
+    {
+      "id": "dots",
+      "path": "../outside.md"
+    },
+    {
+      "id": "tok",
+      "path": "t.md",
+      "approx_tokens": "lots"
+    },
+    {
+      "id": "ok",
+      "path": "dup.md"
+    },
+    "not an object"
+  ]
+}

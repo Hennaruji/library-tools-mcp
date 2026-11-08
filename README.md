@@ -9,8 +9,12 @@ in document order.
 library_server.py    the server
 library/             sample library (proof-of-concept data and conventions)
 tests/smoke.py       end-to-end tests over stdio, one check per behaviour
-tests/fixtures/edge  markdown parsing edge cases and an indexed-but-missing file
+tests/fixtures/      edge cases: markdown parsing, symlink escapes, repeated
+                     images, malformed indexes
 ```
+
+Some fixtures are symlinks. Clone on macOS/Linux (or with symlinks enabled on
+Windows) for the tests to pass.
 
 ## Quick start
 
@@ -73,6 +77,17 @@ estimate tokens itself.
 
 **Image stubs** in markdown: `![[image:img-login-sequence]]`
 
+**Index validation:** both indexes are checked on every call. A missing
+required field, wrong type, duplicate id or bad path fails the call with a
+list of every problem and the entry it belongs to, e.g.
+`documents[3] (id 'dots'): 'path' may not contain '..'`.
+
+**Paths are strictly enforced.** Index paths must be relative, use `/` and
+contain no `..`. Every file is resolved, symlinks included, and must land
+inside the library root; images must also land inside the image index's folder.
+A file that resolves anywhere else is refused, with a note. The index files
+themselves must be inside the library root.
+
 **Sections** are not cached. They are parsed from `#` headings on request
 (re-parsed only when a file changes), following CommonMark for headings and
 fenced code blocks:
@@ -134,6 +149,10 @@ caps heading levels (0 = none).
   `=== auth (backend/auth.md) · section refresh-tokens/rotation · L18–38 ===`.
 - **Content is verbatim:** document lines are returned exactly as written.
   Only headers, placeholders and fence repairs are added.
+- **Images:** sent only when the doc containing their stub is requested with
+  `include_images`. An image that appears more than once in the same doc is sent
+  the first time, and later stubs point back to it. The same image in a
+  different doc is sent again with that doc.
 - **Placeholders:** omitted content becomes a one-line note, e.g.
   `[code block omitted: python, 11 lines, L22–34]` or `[image omitted: img-fanout — caption]`.
 - **Code cuts:** a line range that starts or ends inside a code block gets its fences re-balanced.
@@ -143,7 +162,7 @@ caps heading levels (0 = none).
   code settings, the notice says how the lines were returned, so the agent can
   request them again separately. Separate calls are independent: nothing is
   remembered between them.
-- **Errors:** unknown docs, sections or images and missing files are reported
+- **Errors:** unknown docs, sections or images, missing files and refused paths are reported
   in a `Notes:` block and don't fail the call. Malformed selectors are rejected:
   both `doc` and `root`, unknown fields (e.g. `section` for `sections`), or an
   empty `sections` list.

@@ -19,6 +19,41 @@
       "title": "Gone",
       "summary": "indexed but no file",
       "approx_tokens": 5
+    },
+    {
+      "id": "linked-out",
+      "path": "linked-out.md",
+      "title": "Symlink out",
+      "summary": "escapes via symlink",
+      "approx_tokens": 5
+    },
+    {
+      "id": "alias",
+      "path": "alias.md",
+      "title": "Alias",
+      "summary": "symlink inside the library",
+      "approx_tokens": 100
+    },
+    {
+      "id": "images",
+      "path": "images.md",
+      "title": "Images",
+      "summary": "repeated image",
+      "approx_tokens": 20
+    },
+    {
+      "id": "images2",
+      "path": "images2.md",
+      "title": "More images",
+      "summary": "same image, other doc",
+      "approx_tokens": 10
+    },
+    {
+      "id": "unclosed",
+      "path": "unclosed.md",
+      "title": "Unclosed",
+      "summary": "fence never closed",
+      "approx_tokens": 15
     }
   ]
 }

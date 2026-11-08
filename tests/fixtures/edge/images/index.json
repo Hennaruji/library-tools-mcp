@@ -1,0 +1,14 @@
+{
+  "images": [
+    {
+      "id": "img-a",
+      "file": "a.png",
+      "caption": "A blue square"
+    },
+    {
+      "id": "img-escape",
+      "file": "escape.png",
+      "caption": "Symlink pointing outside the library"
+    }
+  ]
+}

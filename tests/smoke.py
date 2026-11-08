@@ -31,11 +31,11 @@ def text_of(result) -> str:
     return "".join(b.text for b in result.content if b.type == "text")
 
 
-async def session(library: Path, body) -> None:
+async def session(library: Path, body, **env: str) -> None:
     params = StdioServerParameters(
         command=sys.executable,
         args=[str(ROOT / "library_server.py")],
-        env={**get_default_environment(), "LIBRARY_ROOT": str(library)},
+        env={**get_default_environment(), "LIBRARY_ROOT": str(library), **env},
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as s:
@@ -55,8 +55,13 @@ async def session(library: Path, body) -> None:
 async def sample_library(s, call) -> None:
     tools = {t.name: t for t in (await s.list_tools()).tools}
     check(set(tools) == {"list_documents", "get_documents"}, "both tools exposed")
-    check("max_tokens" not in json.dumps(tools["get_documents"].input_schema),
-          "no token budget parameter")
+    schema = json.dumps(tools["get_documents"].input_schema)
+    check("max_tokens" not in schema, "no token budget parameter")
+    check("$ref" not in schema and "$defs" not in schema, "selector schema is inlined (no $ref)")
+    check(all(tools[n].input_schema["properties"][p].get("description")
+              for n, ps in [("get_documents", ["select", "include_images", "include_code"]),
+                            ("list_documents", ["root", "line_bounds", "section_depth"])] for p in ps),
+          "every top-level parameter has a description")
 
     print("list_documents")
     t = text_of(await call("list_documents", {}))
@@ -74,6 +79,13 @@ async def sample_library(s, call) -> None:
     t = text_of(await call("list_documents", {"root": "backend", "section_depth": 1}))
     check("§ refresh-tokens " in t and "refresh-tokens/rotation" not in t,
           "section_depth limits heading levels")
+    t = text_of(await call("list_documents", {"root": "guides", "line_bounds": True}))
+    check('§ _preamble  "(text before the first heading)"  L1–3' in t, "text before the first heading is _preamble")
+    check('§ getting-started  "Getting started"' in t and '§ next-steps  "Next steps"' in t,
+          "a doc with several H1s keeps them as top-level sections")
+    t = text_of(await call("get_documents", {"select": [{"doc": "getting-started", "sections": ["_preamble"]}]}))
+    check("section _preamble · L1–3" in t and "first stop for new contributors" in t,
+          "_preamble can be selected")
     t = text_of(await call("list_documents", {"root": "nowhere"}))
     check("No documents under" in t and "backend" in t, "unknown root suggests top-level entries")
 
@@ -172,7 +184,11 @@ async def edge_library(s, call) -> None:
     check("§ title/after" in t, "inline ```bash``` does not open a fence and hide later headings")
     check("§ title/indented-close" in t and "§ title/tilde" in t,
           "~~~ and indented ``` fences follow CommonMark")
-    check("(file not found)" in t, "listing marks an indexed doc with no file")
+    check("(file not found at missing.md)" in t, "listing marks an indexed doc with no file")
+    check("(linked-out.md resolves outside the library; refused)" in t,
+          "listing refuses a doc that escapes through a symlink")
+    check("- alias " in t and "§ title/after" in t.split("- alias ")[1],
+          "a symlink that stays inside the library is allowed")
 
     t = text_of(await call("get_documents", {"select": [{"doc": "parsing", "sections": ["title/code"]}]}))
     check("    pass\n\n\ndef b():" in t, "blank lines inside code blocks are preserved")
@@ -186,14 +202,77 @@ async def edge_library(s, call) -> None:
 
     r = await call("get_documents", {"select": [{"doc": "gone", "sections": ["x"]}, {"root": "."}]})
     t = text_of(r)
-    check(not r.is_error and "gone file not found" in t and "=== parsing" in t,
+    check(not r.is_error and "gone: file not found at missing.md" in t and "=== parsing" in t,
           "missing file is a note, not a failed call")
+
+    print("edge cases: paths")
+    t = text_of(await call("get_documents", {"select": ["linked-out"]}))
+    check("SECRET" not in t and "resolves outside the library; refused" in t,
+          "doc escaping through a symlink is refused")
+    r = await call("get_documents", {"select": [{"root": "../"}]})
+    check("may not contain '..'" in text_of(r), "root may not climb out of the library")
+
+    print("edge cases: images")
+    r = await call("get_documents", {"select": ["images"], "include_images": True})
+    t = text_of(r)
+    check([b.type for b in r.content].count("image") == 1, "image repeated within one doc is sent once")
+    check("[image img-a: same image as shown earlier in this document]" in t,
+          "repeat within a doc points back to the first")
+    check("img-escape unavailable (file resolves outside the images folder; refused)" in t,
+          "image escaping through a symlink is refused")
+    r = await call("get_documents", {"select": ["images", "images2"], "include_images": True})
+    check([b.type for b in r.content].count("image") == 2, "same image in two docs is sent for each")
+
+    print("edge cases: ranges and fences")
+    t = text_of(await call("get_documents", {"select": [{"doc": "lines", "lines": [3, 99]},
+                                                     {"doc": "lines", "lines": [50, 60]}]}))
+    check("clamped to L3–5" in t and "TARGET" in t, "range past the end of the file is clamped")
+    check("L50–60 is past the end of the file" in t, "range starting past the end is reported")
+    t = text_of(await call("get_documents", {"select": [{"doc": "parsing", "lines": [23, 25]}],
+                                          "include_code": False}))
+    check("[code block omitted: python, 6 lines, L19–26]" in t and "def b" not in t,
+          "include_code=false on a range that only partly covers a code block")
+    t = text_of(await call("list_documents", {"root": "unclosed.md"}))
+    check("§ before" in t and "not-a-heading" not in t, "headings inside an unclosed code block are ignored")
+    t = text_of(await call("get_documents", {"select": ["unclosed"]}))
+    check(t.rstrip().endswith("y = 2\n```"), "unclosed code block is closed in the output")
+
+
+async def bad_indexes() -> None:
+    print("index validation")
+    fixtures = ROOT / "tests" / "fixtures"
+
+    async def bad_index(s, call):
+        r = await call("list_documents", {})
+        t = text_of(r)
+        check(r.is_error and "index.json has 6 problems" in t, "malformed index fails with a problem count")
+        for expected in ["documents[1]: 'id' is required",
+                         "documents[2] (id 'abs'): 'path' must be relative, not absolute",
+                         "documents[3] (id 'dots'): 'path' may not contain '..'",
+                         "documents[4] (id 'tok'): 'approx_tokens' must be a non-negative integer",
+                         "documents[5] (id 'ok'): duplicate id (also used by ok.md)",
+                         "documents[6]: expected an object"]:
+            check(expected in t, f"names the bad entry: {expected.split(':')[0]}")
+
+    async def bad_json(s, call):
+        r = await call("list_documents", {})
+        check(r.is_error and "is not valid JSON (line" in text_of(r), "invalid JSON is reported with its position")
+
+    async def outside_index(s, call):
+        r = await call("list_documents", {})
+        check(r.is_error and "must be inside the library root" in text_of(r),
+              "index location outside the library is refused")
+
+    await session(fixtures / "bad-index", bad_index)
+    await session(fixtures / "bad-json", bad_json)
+    await session(fixtures / "edge", outside_index, LIBRARY_DOC_INDEX="../bad-index/index.json")
 
 
 async def main() -> None:
     print("sample library")
     await session(ROOT / "library", sample_library)
     await session(ROOT / "tests" / "fixtures" / "edge", edge_library)
+    await bad_indexes()
     print(f"\nall {passed} checks passed")
 
 

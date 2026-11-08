@@ -37,11 +37,13 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from typing import Annotated
 from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ImageContent, TextContent
 
 # --------------------------------------------------------------------------
@@ -49,8 +51,8 @@ from mcp.types import ImageContent, TextContent
 # --------------------------------------------------------------------------
 
 LIBRARY_ROOT = Path(os.environ.get("LIBRARY_ROOT", Path(__file__).parent / "library")).resolve()
-DOC_INDEX = LIBRARY_ROOT / os.environ.get("LIBRARY_DOC_INDEX", "index.json")
-IMAGE_INDEX = LIBRARY_ROOT / os.environ.get("LIBRARY_IMAGE_INDEX", "images/index.json")
+DOC_INDEX_REL = os.environ.get("LIBRARY_DOC_INDEX", "index.json")
+IMAGE_INDEX_REL = os.environ.get("LIBRARY_IMAGE_INDEX", "images/index.json")
 MAX_IMAGE_BYTES = int(os.environ.get("LIBRARY_MAX_IMAGE_BYTES", 5 * 1024 * 1024))
 
 IMAGE_STUB = re.compile(r"!\[\[image:([A-Za-z0-9_.\-]+)\]\]")
@@ -69,6 +71,71 @@ MIME_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 # Indexes
 # --------------------------------------------------------------------------
 
+class LibraryIndexError(ToolError):
+    """An index file is missing, unreadable or has invalid entries. Subclassing
+    the SDK's ToolError makes the message reach the calling agent; other
+    exceptions are reported only as "Error executing tool"."""
+
+
+# --- Path enforcement ------------------------------------------------------
+# Every file the server reads must resolve (symlinks included) to a location
+# inside LIBRARY_ROOT; images must also resolve inside the image index's
+# folder. Index paths must be relative, '/'-separated and free of '..'.
+
+def check_relative_path(value: object) -> str | None:
+    """Return a problem description, or None if `value` is an acceptable path."""
+    if not isinstance(value, str) or not value.strip():
+        return "must be a non-empty string"
+    if "\\" in value:
+        return "must use '/' separators"
+    p = PurePosixPath(value)
+    if p.is_absolute():
+        return "must be relative, not absolute"
+    if ".." in p.parts:
+        return "may not contain '..'"
+    return None
+
+
+def resolve_inside(base: Path, rel: str) -> Path | None:
+    """base/rel with symlinks resolved, or None if that lands outside base."""
+    base = base.resolve()
+    p = (base / rel).resolve()
+    return p if base in p.parents else None
+
+
+def index_file(rel: str, label: str) -> Path:
+    err = check_relative_path(rel)
+    path = None if err else resolve_inside(LIBRARY_ROOT, rel)
+    if path is None:
+        raise LibraryIndexError(f"{label} location {rel!r} must be inside the library root"
+                                + (f" ({err})" if err else ""))
+    return path
+
+
+def _read_index_json(path: Path, label: str) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as e:
+        raise LibraryIndexError(f"{label} {path.name} is not valid JSON "
+                                f"(line {e.lineno}, column {e.colno}): {e.msg}") from None
+
+
+def _raise_if_problems(label: str, name: str, problems: list[str]) -> None:
+    if problems:
+        shown = problems[:20]
+        more = f"\n- ... and {len(problems) - 20} more" if len(problems) > 20 else ""
+        raise LibraryIndexError(f"{label} {name} has {len(problems)} problem"
+                                f"{'' if len(problems) == 1 else 's'}:\n"
+                                + "\n".join(f"- {p}" for p in shown) + more)
+
+
+def _where(kind: str, i: int, d: object) -> str:
+    ident = d.get("id") if isinstance(d, dict) else None
+    return f"{kind}[{i}]" + (f" (id {ident!r})" if isinstance(ident, str) and ident else "")
+
+
+# --- Indexes ---------------------------------------------------------------
+
 @dataclass
 class DocEntry:
     id: str
@@ -77,42 +144,96 @@ class DocEntry:
     summary: str
     approx_tokens: int | None
 
-    @property
-    def file(self) -> Path:
-        return LIBRARY_ROOT / self.path
+    def locate(self) -> tuple[Path | None, str | None]:
+        """(file, None) if readable, else (None, reason). Enforces the library boundary."""
+        file = resolve_inside(LIBRARY_ROOT, self.path)
+        if file is None:
+            return None, f"{self.path} resolves outside the library; refused"
+        if not file.is_file():
+            return None, f"file not found at {self.path}"
+        return file, None
 
 
 @dataclass
 class ImageEntry:
     id: str
-    file: Path
+    file: str            # relative to the image index's folder
     caption: str
 
 
 def load_doc_index() -> dict[str, DocEntry]:
-    data = json.loads(DOC_INDEX.read_text(encoding="utf-8"))
+    label = "document index"
+    path = index_file(DOC_INDEX_REL, label)
+    if not path.is_file():
+        raise LibraryIndexError(f"{label} not found at {DOC_INDEX_REL}")
+    data = _read_index_json(path, label)
+    docs = data.get("documents") if isinstance(data, dict) else None
+    if not isinstance(docs, list):
+        raise LibraryIndexError(f"{label} {path.name} must be an object with a 'documents' list")
+
+    problems: list[str] = []
     out: dict[str, DocEntry] = {}
-    for d in data["documents"]:
-        entry = DocEntry(
-            id=d["id"],
-            path=PurePosixPath(d["path"]).as_posix(),
-            title=d.get("title") or d["id"],
-            summary=d.get("summary", ""),
-            approx_tokens=d.get("approx_tokens"),
-        )
-        if entry.id in out:
-            raise ValueError(f"duplicate document id in index: {entry.id!r}")
-        out[entry.id] = entry
+    for i, d in enumerate(docs):
+        where, before = _where("documents", i, d), len(problems)
+        if not isinstance(d, dict):
+            problems.append(f"{where}: expected an object")
+            continue
+        for key in ("id", "path"):
+            if not isinstance(d.get(key), str) or not d[key].strip():
+                problems.append(f"{where}: '{key}' is required and must be a non-empty string")
+        if isinstance(d.get("path"), str) and d["path"].strip():
+            if err := check_relative_path(d["path"]):
+                problems.append(f"{where}: 'path' {err}")
+        for key in ("title", "summary"):
+            if d.get(key) is not None and not isinstance(d[key], str):
+                problems.append(f"{where}: '{key}' must be a string")
+        t = d.get("approx_tokens")
+        if t is not None and (isinstance(t, bool) or not isinstance(t, int) or t < 0):
+            problems.append(f"{where}: 'approx_tokens' must be a non-negative integer")
+        if isinstance(d.get("id"), str) and d["id"] in out:
+            problems.append(f"{where}: duplicate id (also used by {out[d['id']].path})")
+        if len(problems) == before:
+            out[d["id"]] = DocEntry(d["id"], PurePosixPath(d["path"]).as_posix(),
+                                    d.get("title") or d["id"], d.get("summary") or "", t)
+    _raise_if_problems(label, path.name, problems)
     return dict(sorted(out.items(), key=lambda kv: kv[1].path))
 
 
+def image_dir() -> Path:
+    return index_file(IMAGE_INDEX_REL, "image index").parent
+
+
 def load_image_index() -> dict[str, ImageEntry]:
-    if not IMAGE_INDEX.is_file():
-        return {}
-    base = IMAGE_INDEX.parent
-    data = json.loads(IMAGE_INDEX.read_text(encoding="utf-8"))
-    return {i["id"]: ImageEntry(i["id"], base / i["file"], i.get("caption", ""))
-            for i in data["images"]}
+    label = "image index"
+    path = index_file(IMAGE_INDEX_REL, label)
+    if not path.is_file():
+        return {}                     # a library without images is fine
+    data = _read_index_json(path, label)
+    imgs = data.get("images") if isinstance(data, dict) else None
+    if not isinstance(imgs, list):
+        raise LibraryIndexError(f"{label} {path.name} must be an object with an 'images' list")
+
+    problems: list[str] = []
+    out: dict[str, ImageEntry] = {}
+    for i, d in enumerate(imgs):
+        where, before = _where("images", i, d), len(problems)
+        if not isinstance(d, dict):
+            problems.append(f"{where}: expected an object")
+            continue
+        for key in ("id", "file"):
+            if not isinstance(d.get(key), str) or not d[key].strip():
+                problems.append(f"{where}: '{key}' is required and must be a non-empty string")
+        if isinstance(d.get("file"), str) and d["file"].strip():
+            if err := check_relative_path(d["file"]):
+                problems.append(f"{where}: 'file' {err}")
+        if d.get("caption") is not None and not isinstance(d["caption"], str):
+            problems.append(f"{where}: 'caption' must be a string")
+        if isinstance(d.get("id"), str) and d["id"] in out:
+            problems.append(f"{where}: duplicate id")
+        if len(problems) == before:
+            out[d["id"]] = ImageEntry(d["id"], d["file"], d.get("caption") or "")
+    _raise_if_problems(label, path.name, problems)
+    return out
 
 
 def normalize_root(root: str) -> str:
@@ -448,10 +569,11 @@ def plan(selectors: list, include_images: bool, include_code: bool,
             entries = [entry]
 
         for entry in entries:
-            if not entry.file.is_file():
-                notes.append(f"selector {sel_no}: {entry.id} file not found at {entry.path}")
+            file, err = entry.locate()
+            if err:
+                notes.append(f"selector {sel_no}: {entry.id}: {err}")
                 continue
-            doc = parse_doc(entry.file)
+            doc = parse_doc(file)
             if doc.n == 0:
                 notes.append(f"selector {sel_no}: {entry.id} is empty")
                 continue
@@ -476,26 +598,35 @@ def plan(selectors: list, include_images: bool, include_code: bool,
 # Rendering
 # --------------------------------------------------------------------------
 
-def _image_block(img: ImageEntry) -> tuple[ImageContent | None, str | None]:
-    if not img.file.is_file():
+def _image_block(img: ImageEntry, folder: Path) -> tuple[ImageContent | None, str | None]:
+    file = resolve_inside(folder, img.file)
+    if file is None:
+        return None, "file resolves outside the images folder; refused"
+    if not file.is_file():
         return None, "file missing"
-    if img.file.suffix.lower() not in MIME_TYPES:
-        return None, f"unsupported type {img.file.suffix}"
-    if img.file.stat().st_size > MAX_IMAGE_BYTES:
+    if file.suffix.lower() not in MIME_TYPES:
+        return None, f"unsupported type {file.suffix}"
+    if file.stat().st_size > MAX_IMAGE_BYTES:
         return None, "too large to inline"
     return ImageContent(type="image",
-                        data=base64.b64encode(img.file.read_bytes()).decode(),
-                        mime_type=MIME_TYPES[img.file.suffix.lower()]), None
+                        data=base64.b64encode(file.read_bytes()).decode(),
+                        mime_type=MIME_TYPES[file.suffix.lower()]), None
 
 
-def render(piece: Piece, images: dict[str, ImageEntry],
+def render(piece: Piece, images: dict[str, ImageEntry], folder: Path,
+           sent_images: dict[str, set[str]],
            blocks: list[TextContent | ImageContent]) -> None:
     """Document lines are emitted exactly as written; only headers,
-    placeholders and fence repairs are added around them."""
+    placeholders and fence repairs are added around them.
+
+    `sent_images` maps doc id -> image ids already sent in this call, so an
+    image repeated within one document is sent once. The same image in a
+    different document is sent again."""
     doc, e = piece.doc, piece.entry
     part = " (part)" if piece.partial else ""
-    buf: list[str] = [f"\n=== {e.id} ({e.path}) · {piece.label}{part} · "
-                      f"L{piece.start}–{piece.end} ===\n"]
+    # A lines selector's label would just repeat the range, so it is omitted.
+    what = "" if piece.label.startswith("lines ") else f" · {piece.label}{part}"
+    buf: list[str] = [f"\n=== {e.id} ({e.path}){what} · L{piece.start}–{piece.end} ===\n"]
 
     def flush() -> None:
         text = "".join(buf)
@@ -530,11 +661,14 @@ def render(piece: Piece, images: dict[str, ImageEntry],
                 buf.append(f"[image {m.group(1)}: not in image index]")
             elif not piece.include_images:
                 buf.append(f"[image omitted: {img.id} — {img.caption}]")
+            elif img.id in sent_images.setdefault(e.id, set()):
+                buf.append(f"[image {img.id}: same image as shown earlier in this document]")
             else:
-                block, err = _image_block(img)
+                block, err = _image_block(img, folder)
                 if err:
                     buf.append(f"[image {img.id} unavailable ({err}): {img.caption}]")
                 else:
+                    sent_images[e.id].add(img.id)
                     buf.append(f"[image {img.id}: {img.caption}]\n")
                     flush()
                     blocks.append(block)
@@ -602,12 +736,13 @@ def _render_tree(node: dict, indent: str, line_bounds: bool,
         tokens = f"~{e.approx_tokens} tokens" if e.approx_tokens is not None else "tokens unknown"
         out.append(f"{indent}- {e.id}  [{fname}]  {tokens}"
                    f"{f'  — {e.summary}' if e.summary else ''}")
-        if not e.file.is_file():
-            out.append(f"{indent}    (file not found)")
+        file, err = e.locate()
+        if err:
+            out.append(f"{indent}    ({err})")
             continue
         if section_depth is not None and section_depth <= 0:
             continue
-        doc = parse_doc(e.file)
+        doc = parse_doc(file)
         if doc.tree:
             bounds = f", {doc.n} lines" if line_bounds else ""
             out.append(f"{indent}    sections{bounds}:")
@@ -632,8 +767,14 @@ mcp = MCPServer(
 
 
 @mcp.tool(structured_output=False)
-def list_documents(root: str = ".", line_bounds: bool = False,
-                   section_depth: int | None = None) -> str:
+def list_documents(
+    root: Annotated[str, Field(description=(
+        "Directory to list, relative to the library root. '.' lists the whole library"))] = ".",
+    line_bounds: Annotated[bool, Field(description=(
+        "Also show each section's file line range, for use in get_documents line selectors"))] = False,
+    section_depth: Annotated[int | None, Field(description=(
+        "Heading levels to show: 0 = none, 1 = top-level sections only, null = all"))] = None,
+) -> str:
     """Show the library as a tree starting at `root` (a directory path relative to
     the library root; "." for everything). Each doc shows its id, approx tokens
     and summary from the library index, and its section outline: each section's
@@ -664,9 +805,12 @@ def list_documents(root: str = ".", line_bounds: bool = False,
 
 @mcp.tool(structured_output=False)
 def get_documents(
-    select: list[str | Selector],
-    include_images: bool = False,
-    include_code: bool = True,
+    select: Annotated[list[str | Selector], Field(min_length=1, description=(
+        "What to include, in order: doc id strings and/or selector objects"))],
+    include_images: Annotated[bool, Field(description=(
+        "Default for every selector: send images inline (true) or as one-line placeholders"))] = False,
+    include_code: Annotated[bool, Field(description=(
+        "Default for every selector: include fenced code blocks (true) or one-line placeholders"))] = True,
 ) -> list[TextContent | ImageContent]:
     """Assemble one package of library content from any mix of selectors, in the
     order given. Markdown text, fenced code blocks and images are interleaved in
@@ -692,15 +836,18 @@ def get_documents(
     pieces, overlaps, notes = plan(select, include_images, include_code, index)
 
     docs_count = len({p.entry.id for p in pieces})
-    summary = f"Package: {len(pieces)} chunks from {docs_count} docs"
+    summary = (f"Package: {len(pieces)} chunk{'' if len(pieces) == 1 else 's'} from "
+               f"{docs_count} doc{'' if docs_count == 1 else 's'}")
     extras = [f"{len(overlaps)} overlap notice{'' if len(overlaps) == 1 else 's'}"] if overlaps else []
     extras += [f"{len(notes)} note{'' if len(notes) == 1 else 's'}"] if notes else []
     if extras:
         summary += f" ({', '.join(extras)} at the end)"
 
     blocks: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
+    folder = image_dir()
+    sent_images: dict[str, set[str]] = {}
     for p in pieces:
-        render(p, images, blocks)
+        render(p, images, folder, sent_images, blocks)
     if overlaps:
         blocks.append(TextContent(type="text", text="\nOverlap notices:\n"
                                   + "\n".join(f"- {o}" for o in overlaps)))
@@ -708,6 +855,31 @@ def get_documents(
         blocks.append(TextContent(type="text", text="\nNotes:\n"
                                   + "\n".join(f"- {n}" for n in notes)))
     return blocks
+
+
+def inline_refs(schema: dict) -> dict:
+    """Replace local "$ref": "#/$defs/X" pointers with the definitions they name.
+    Some MCP clients render $defs/$ref poorly; the inlined schema is equivalent."""
+    defs = schema.get("$defs", {})
+
+    def walk(node):
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                target = walk(defs[ref.rsplit("/", 1)[1]])
+                return {**target, **{k: walk(v) for k, v in node.items() if k != "$ref"}}
+            return {k: walk(v) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        return node
+
+    return walk(schema)
+
+
+# The SDK has no public hook for adjusting a tool's generated input schema, so
+# this reaches into its tool manager once at startup.
+for _tool in mcp._tool_manager.list_tools():
+    _tool.parameters = inline_refs(_tool.parameters)
 
 
 if __name__ == "__main__":
