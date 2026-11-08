@@ -57,9 +57,13 @@ async def main() -> None:
             check("L18–38" not in t, "line bounds hidden by default")
             t = text_of(await call("list_documents", {"root": "backend/storage", "line_bounds": True}))
             check("caching" in t and "auth" not in t, "root narrows the tree")
-            check("§ fan-out-deletes" in t and "L21–34" in t, "nested sections with line bounds")
+            check("§ invalidation/fan-out-deletes  \"Fan-out deletes\"" in t and "L21–34" in t,
+                  "nested sections listed with full id, title and line bounds")
+            check("§ adding-a-column/examples" in t and "§ dropping-a-column/examples" in t,
+                  "duplicate heading names get distinct ids")
             t = text_of(await call("list_documents", {"root": "backend", "section_depth": 1}))
-            check("§ refresh-tokens" in t and "§ rotation" not in t, "section_depth limits heading levels")
+            check("§ refresh-tokens " in t and "refresh-tokens/rotation" not in t,
+                  "section_depth limits heading levels")
             t = text_of(await call("list_documents", {"root": "nowhere"}))
             check("No documents under" in t and "backend" in t, "unknown root suggests top-level entries")
 

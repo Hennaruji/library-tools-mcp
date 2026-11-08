@@ -75,7 +75,8 @@ counts are cached here; `path` is relative to the library root.
 (re-parsed only when a file changes):
 
 - A section id is its heading slug, nested with `/`: `refresh-tokens/rotation`.
-  A unique leaf (`rotation`) also works; an ambiguous one returns the candidates.
+  `list_documents` always shows full ids. A unique leaf (`rotation`) is also
+  accepted as a convenience; an ambiguous one returns the candidates.
 - A doc with exactly one `#` heading treats it as the title. Its sections start
   at `##`, and the text under the title is the `_intro` section.
 - Text before the first heading is `_preamble`.
@@ -96,14 +97,15 @@ backend/storage/  (2 docs, ~351 tokens)
 
 - caching  [caching.md]  ~226 tokens  — Redis key conventions, invalidation ...
     sections, 38 lines:
-      § _intro  ~34  L1–5  Caching
-      § key-conventions  ~43  L6–16  Key conventions
-      § invalidation  ~120  L17–34  Invalidation
-        § fan-out-deletes  ~98  L21–34  Fan-out deletes
-      § ttl-rules  ~28  L35–38  TTL rules
+      § _intro  "Caching"  ~34  L1–5
+      § key-conventions  "Key conventions"  ~43  L6–16
+      § invalidation  "Invalidation"  ~120  L17–34
+        § invalidation/fan-out-deletes  "Fan-out deletes"  ~98  L21–34
+      § ttl-rules  "TTL rules"  ~28  L35–38
 ```
 
-`line_bounds` adds the `L…` ranges; `section_depth` caps heading levels (0 = none).
+Each section shows its full id (copy it verbatim into a `sections` selector) and
+its heading text. `line_bounds` adds the `L…` ranges; `section_depth` caps heading levels (0 = none).
 
 ### `get_documents(select, include_images=false, include_code=true, max_tokens=50000)`
 

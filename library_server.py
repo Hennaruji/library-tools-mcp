@@ -550,7 +550,8 @@ def _section_lines(secs: list[Section], indent: str, line_bounds: bool,
     out = []
     for s in secs:
         bounds = f"  L{s.start}–{s.end}" if line_bounds else ""
-        out.append(f"{indent}§ {s.slug}  ~{fmt_tokens(s.tokens)}{bounds}  {s.title}")
+        # Full id, so the agent can copy it verbatim into a sections selector.
+        out.append(f"{indent}§ {s.id}  \"{s.title}\"  ~{fmt_tokens(s.tokens)}{bounds}")
         out += _section_lines(s.children, indent + "  ", line_bounds,
                               None if depth_left is None else depth_left - 1)
     return out
@@ -646,7 +647,7 @@ def list_documents(root: str = ".", line_bounds: bool = False,
     head = [
         f"{r or '.'}/  ({c} docs, ~{fmt_tokens(t)} tokens)",
         "Fetch with get_documents: a doc id, {root}, {doc, sections: [...]} or "
-        "{doc, lines: [start, end]}. Section ids nest with '/'; a unique leaf slug also works.",
+        "{doc, lines: [start, end]}. Use section ids exactly as shown after §.",
         "",
     ]
     return "\n".join(head + _render_tree(tree, "", line_bounds, section_depth))
