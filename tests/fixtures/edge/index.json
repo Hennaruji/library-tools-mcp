@@ -1,0 +1,24 @@
+{
+  "documents": [
+    {
+      "id": "parsing",
+      "path": "parsing.md",
+      "title": "Parsing",
+      "summary": "edge cases",
+      "approx_tokens": 100
+    },
+    {
+      "id": "lines",
+      "path": "lines.md",
+      "title": "Lines",
+      "summary": "line numbering"
+    },
+    {
+      "id": "gone",
+      "path": "missing.md",
+      "title": "Gone",
+      "summary": "indexed but no file",
+      "approx_tokens": 5
+    }
+  ]
+}

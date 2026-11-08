@@ -3,8 +3,8 @@ library_server.py: an MCP server for reading an indexed markdown library.
 
 The agent browses the library as a tree (list_documents), then requests a
 "package" of context (get_documents) built from any mix of whole docs,
-directory roots, named sections and line ranges. Text, code blocks and
-images come back interleaved in document order.
+directory roots, named sections and line ranges. Markdown text (including
+fenced code blocks) and images come back interleaved in document order.
 
 Library conventions (all paths relative to LIBRARY_ROOT):
 
@@ -16,11 +16,15 @@ Library conventions (all paths relative to LIBRARY_ROOT):
 
     Image stubs in markdown:   ![[image:<image_id>]]
 
+Token counts come only from the document index; this server does not
+estimate tokens itself.
+
 Sections are not cached: they are parsed from ATX headings (#, ##, ...) on
-each request. A section id is its heading slug, nested with "/" for
-subsections (auth: "refresh-tokens/rotation"). A bare leaf slug ("rotation")
-also works when it is unique within the doc. Line numbers are the file's own
-1-based line numbers, so they agree with Read and grep.
+request (re-parsed only when a file changes). A section id is its heading
+slug, nested with "/" for subsections (auth: "refresh-tokens/rotation").
+list_documents always shows full ids; a bare leaf slug is also accepted
+when unique within the doc. Line numbers are the file's own 1-based line
+numbers (lines split on \n only), so they agree with Read and grep.
 
 Run:   python library_server.py           (stdio transport)
 Needs: pip install "mcp>=2"
@@ -35,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ImageContent, TextContent
@@ -47,26 +51,18 @@ from mcp.types import ImageContent, TextContent
 LIBRARY_ROOT = Path(os.environ.get("LIBRARY_ROOT", Path(__file__).parent / "library")).resolve()
 DOC_INDEX = LIBRARY_ROOT / os.environ.get("LIBRARY_DOC_INDEX", "index.json")
 IMAGE_INDEX = LIBRARY_ROOT / os.environ.get("LIBRARY_IMAGE_INDEX", "images/index.json")
-DEFAULT_MAX_TOKENS = int(os.environ.get("LIBRARY_MAX_TOKENS", 50_000))
-IMAGE_TOKEN_ESTIMATE = int(os.environ.get("LIBRARY_IMAGE_TOKENS", 1_500))
 MAX_IMAGE_BYTES = int(os.environ.get("LIBRARY_MAX_IMAGE_BYTES", 5 * 1024 * 1024))
 
 IMAGE_STUB = re.compile(r"!\[\[image:([A-Za-z0-9_.\-]+)\]\]")
-HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-CODE_PLACEHOLDER_TOKENS = 12
+# CommonMark ATX heading: up to 3 spaces of indent, 1-6 #s, then a space or
+# end of line. A closing run of #s only counts when preceded by whitespace,
+# so "## C#" keeps its title.
+HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 
 MIME_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
               ".gif": "image/gif", ".webp": "image/webp"}
-
-
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate (~4 characters per token)."""
-    return round(len(text) / 4)
-
-
-def fmt_tokens(n: int) -> str:
-    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
 # --------------------------------------------------------------------------
@@ -83,7 +79,7 @@ class DocEntry:
 
     @property
     def file(self) -> Path:
-        return (LIBRARY_ROOT / self.path).resolve()
+        return LIBRARY_ROOT / self.path
 
 
 @dataclass
@@ -115,10 +111,8 @@ def load_image_index() -> dict[str, ImageEntry]:
         return {}
     base = IMAGE_INDEX.parent
     data = json.loads(IMAGE_INDEX.read_text(encoding="utf-8"))
-    return {
-        i["id"]: ImageEntry(i["id"], (base / i["file"]).resolve(), i.get("caption", ""))
-        for i in data["images"]
-    }
+    return {i["id"]: ImageEntry(i["id"], base / i["file"], i.get("caption", ""))
+            for i in data["images"]}
 
 
 def normalize_root(root: str) -> str:
@@ -145,10 +139,9 @@ class Section:
     id: str              # full path id, e.g. "refresh-tokens/rotation"
     slug: str            # leaf slug, e.g. "rotation"
     title: str
-    level: int           # heading level; 0 for the preamble
+    level: int           # heading level; 0 for _intro / _preamble
     start: int           # 1-based, heading line
     end: int             # inclusive
-    tokens: int
     children: list[Section] = field(default_factory=list)
 
 
@@ -156,7 +149,7 @@ class Section:
 class Fence:
     start: int           # opening fence line
     end: int             # closing fence line (or last line if unclosed)
-    marker: str          # ``` or ~~~ (as written)
+    marker: str          # opening run as written, e.g. ``` or ~~~~
     lang: str
     closed: bool
 
@@ -173,6 +166,13 @@ class ParsedDoc:
     def n(self) -> int:
         return len(self.lines)
 
+    def has_code(self, a: int, b: int) -> bool:
+        return any(self.line_fence[i - 1] is not None for i in range(a, b + 1))
+
+    def has_images(self, a: int, b: int) -> bool:
+        return any(self.line_fence[i - 1] is None and IMAGE_STUB.search(self.lines[i - 1])
+                   for i in range(a, b + 1))
+
 
 _parse_cache: dict[Path, tuple[float, ParsedDoc]] = {}
 
@@ -182,13 +182,21 @@ def slugify(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-") or "section"
 
 
+def split_lines(text: str) -> list[str]:
+    """Split on \\n only (like grep and Read), dropping a trailing \\r per line."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def parse_doc(path: Path) -> ParsedDoc:
     mtime = path.stat().st_mtime
     cached = _parse_cache.get(path)
     if cached and cached[0] == mtime:
         return cached[1]
 
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = split_lines(path.read_text(encoding="utf-8-sig", errors="replace"))
     n = len(lines)
     fences: list[Fence] = []
     line_fence: list[int | None] = [None] * n
@@ -197,37 +205,36 @@ def parse_doc(path: Path) -> ParsedDoc:
 
     for ln, line in enumerate(lines, 1):
         if open_fence is None:
-            m = FENCE.match(line)
-            if m:
+            m = FENCE_OPEN.match(line)
+            # A backtick fence's info string may not contain backticks
+            # (so "```bash``` is the tool" is inline code, not a fence).
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
                 open_fence = (ln, m.group(1), m.group(2).strip())
                 line_fence[ln - 1] = len(fences)
                 continue
             h = HEADING.match(line)
             if h:
-                headings.append((ln, len(h.group(1)), h.group(2).strip()))
+                headings.append((ln, len(h.group(1)), (h.group(2) or "").strip()))
         else:
             line_fence[ln - 1] = len(fences)
-            s, marker = line.strip(), open_fence[1]
-            if s and set(s) == {marker[0]} and len(s) >= len(marker):
+            c = FENCE_CLOSE.match(line)
+            marker = open_fence[1]
+            if c and c.group(1)[0] == marker[0] and len(c.group(1)) >= len(marker):
                 fences.append(Fence(open_fence[0], ln, marker, open_fence[2], True))
                 open_fence = None
     if open_fence:
         fences.append(Fence(open_fence[0], n, open_fence[1], open_fence[2], False))
 
-    def body(a: int, b: int) -> str:
-        return "\n".join(lines[a - 1:b])
-
-    # A doc with exactly one H1 uses it as its title: the H1 is not a level of
-    # the section tree, and the text under it (before the first subheading)
-    # becomes "_intro". Without this, every id would start with the title slug.
+    # A doc whose first heading is its only H1 uses that H1 as its title: the
+    # H1 is not a level of the section tree, and the text under it (up to the
+    # next heading) is "_intro". Otherwise every id would start with the title.
     intro: Section | None = None
     h1s = [h for h in headings if h[1] == 1]
-    if len(h1s) == 1:
+    if len(h1s) == 1 and headings[0] == h1s[0]:
         title_ln = h1s[0][0]
-        headings = [h for h in headings if h[1] != 1]
-        nxt = next((h[0] for h in headings if h[0] > title_ln), n + 1)
-        intro = Section("_intro", "_intro", h1s[0][2], 0, title_ln, nxt - 1,
-                        estimate_tokens(body(title_ln, nxt - 1)))
+        headings = headings[1:]
+        nxt = headings[0][0] if headings else n + 1
+        intro = Section("_intro", "_intro", h1s[0][2], 0, title_ln, nxt - 1)
 
     tree: list[Section] = []
     flat: list[Section] = []
@@ -239,11 +246,10 @@ def parse_doc(path: Path) -> ParsedDoc:
         parent = stack[-1] if stack else None
         siblings = parent.children if parent else tree
         base = slug = slugify(title)
-        c = 2
+        i = 2
         while any(s.slug == slug for s in siblings):
-            slug, c = f"{base}-{c}", c + 1
-        sec = Section(f"{parent.id}/{slug}" if parent else slug, slug, title,
-                      level, ln, end, estimate_tokens(body(ln, end)))
+            slug, i = f"{base}-{i}", i + 1
+        sec = Section(f"{parent.id}/{slug}" if parent else slug, slug, title, level, ln, end)
         siblings.append(sec)
         flat.append(sec)
         stack.append(sec)
@@ -252,10 +258,9 @@ def parse_doc(path: Path) -> ParsedDoc:
         tree.insert(0, intro)
         flat.insert(0, intro)
 
-    first = min([h[0] for h in headings] + ([intro.start] if intro else []) + [n + 1])
-    if first > 1 and body(1, first - 1).strip():
-        pre = Section("_preamble", "_preamble", "(text before the first heading)", 0,
-                      1, first - 1, estimate_tokens(body(1, first - 1)))
+    first = intro.start if intro else (headings[0][0] if headings else n + 1)
+    if first > 1 and "\n".join(lines[:first - 1]).strip():
+        pre = Section("_preamble", "_preamble", "(text before the first heading)", 0, 1, first - 1)
         tree.insert(0, pre)
         flat.insert(0, pre)
 
@@ -296,27 +301,20 @@ def merge(ranges: list[Range]) -> list[Range]:
     return out
 
 
-def subtract(ranges: list[Range], taken: list[Range]) -> list[Range]:
-    out: list[Range] = []
-    for a, b in ranges:
-        pieces = [(a, b)]
-        for ta, tb in taken:
-            nxt: list[Range] = []
-            for pa, pb in pieces:
-                if tb < pa or ta > pb:
-                    nxt.append((pa, pb))
-                    continue
-                if pa < ta:
-                    nxt.append((pa, ta - 1))
-                if tb < pb:
-                    nxt.append((tb + 1, pb))
-            pieces = nxt
-        out.extend(pieces)
-    return out
-
-
-def fmt_ranges(ranges: list[Range]) -> str:
-    return ", ".join(f"L{a}–{b}" for a, b in ranges)
+def subtract(r: Range, taken: list[Range]) -> list[Range]:
+    pieces = [r]
+    for ta, tb in taken:
+        nxt: list[Range] = []
+        for pa, pb in pieces:
+            if tb < pa or ta > pb:
+                nxt.append((pa, pb))
+                continue
+            if pa < ta:
+                nxt.append((pa, ta - 1))
+            if tb < pb:
+                nxt.append((tb + 1, pb))
+        pieces = nxt
+    return pieces
 
 
 # --------------------------------------------------------------------------
@@ -326,13 +324,15 @@ def fmt_ranges(ranges: list[Range]) -> str:
 class Selector(BaseModel):
     """One piece of the requested package. Give exactly one of doc / root."""
 
+    model_config = ConfigDict(extra="forbid")
+
     doc: str | None = Field(None, description="Document id (from list_documents)")
     root: str | None = Field(None, description=(
         "Directory path relative to the library root; selects every doc under it. "
         "'.' selects the whole library"))
-    sections: list[str] | None = Field(None, description=(
-        "With doc: section ids to include (subsections come along). Full ids like "
-        "'refresh-tokens/rotation' or a unique leaf like 'rotation'"))
+    sections: list[str] | None = Field(None, min_length=1, description=(
+        "With doc: section ids exactly as shown by list_documents (subsections "
+        "come along), returned in the order given"))
     lines: list[int] | None = Field(None, min_length=2, max_length=2, description=(
         "With doc: [start, end], inclusive, 1-based file line numbers"))
     include_images: bool | None = Field(None, description="Override the call-level setting")
@@ -342,11 +342,11 @@ class Selector(BaseModel):
     def _check(self) -> Selector:
         if (self.doc is None) == (self.root is None):
             raise ValueError("each selector needs exactly one of 'doc' or 'root'")
-        if self.root is not None and (self.sections or self.lines):
+        if self.root is not None and (self.sections is not None or self.lines is not None):
             raise ValueError("'sections' and 'lines' only apply to a 'doc' selector")
-        if self.sections and self.lines:
+        if self.sections is not None and self.lines is not None:
             raise ValueError("use 'sections' or 'lines', not both (make two selectors)")
-        if self.lines and not (1 <= self.lines[0] <= self.lines[1]):
+        if self.lines is not None and not (1 <= self.lines[0] <= self.lines[1]):
             raise ValueError("'lines' must be [start, end] with 1 <= start <= end")
         return self
 
@@ -357,125 +357,128 @@ class Piece:
     doc: ParsedDoc
     start: int
     end: int
+    label: str           # "full document", "section <id>", "lines A–B"
+    partial: bool        # part of the request was already returned by an overlap
     include_images: bool
     include_code: bool
 
-    @property
-    def label(self) -> str:
-        if self.start == 1 and self.end == self.doc.n:
-            return "full document"
-        for s in self.doc.sections:
-            if s.start == self.start and s.end == self.end:
-                return f"section {s.id}"
-        return "lines"
 
-    def estimate(self) -> int:
-        tokens, ln = 0, self.start
-        while ln <= self.end:
-            fi = self.doc.line_fence[ln - 1]
-            if fi is None:
-                line = self.doc.lines[ln - 1]
-                tokens += estimate_tokens(line + "\n")
-                if self.include_images:
-                    tokens += IMAGE_TOKEN_ESTIMATE * len(IMAGE_STUB.findall(line))
-                ln += 1
-            else:
-                g_end = min(self.end, self.doc.fences[fi].end)
-                tokens += (estimate_tokens("\n".join(self.doc.lines[ln - 1:g_end]))
-                           if self.include_code else CODE_PLACEHOLDER_TOKENS)
-                ln = g_end + 1
-        return tokens
+@dataclass
+class Claim:
+    """Lines already placed in the package, and by which selector."""
+    start: int
+    end: int
+    selector: int        # 1-based position in `select`
+    label: str
+    include_images: bool
+    include_code: bool
 
 
-def plan(selectors: list[str | Selector], include_images: bool, include_code: bool,
-         index: dict[str, DocEntry]) -> tuple[list[Piece], list[str]]:
+def _describe_settings(c: Claim) -> str:
+    return (f"images {'included' if c.include_images else 'omitted'}, "
+            f"code {'included' if c.include_code else 'omitted'}")
+
+
+def plan(selectors: list, include_images: bool, include_code: bool,
+         index: dict[str, DocEntry]) -> tuple[list[Piece], list[str], list[str]]:
+    """Returns (pieces, overlap notices, other notes)."""
     pieces: list[Piece] = []
+    overlaps: list[str] = []
     notes: list[str] = []
-    taken: dict[str, list[Range]] = {}
+    claims: dict[str, list[Claim]] = {}
 
-    for item in selectors:
-        sel = (Selector(doc=item) if isinstance(item, str)
-               else item if isinstance(item, Selector) else Selector.model_validate(item))
+    def add(entry: DocEntry, doc: ParsedDoc, a: int, b: int, label: str,
+            sel_no: int, imgs: bool, code: bool) -> None:
+        if a > doc.n:
+            notes.append(f"selector {sel_no}: {entry.id} L{a}–{b} is past the end "
+                         f"of the file ({doc.n} lines)")
+            return
+        if b > doc.n:
+            notes.append(f"selector {sel_no}: {entry.id} L{a}–{b} clamped to "
+                         f"L{a}–{doc.n} (end of file)")
+            b = doc.n
+        prior = claims.setdefault(entry.id, [])
+        for c in prior:
+            oa, ob = max(a, c.start), min(b, c.end)
+            if oa > ob:
+                continue
+            same = c.selector == sel_no
+            where = "an earlier part of the same selector" if same else f"selector {c.selector}"
+            chunk = (f"the '{entry.id} {c.label}' chunk" if same
+                     else f"selector {c.selector}'s '{entry.id} {c.label}' chunk")
+            msg = (f"selector {sel_no} ({entry.id} {label}) overlaps {where} "
+                   f"at L{oa}–{ob}; those lines appear once, in {chunk} above")
+            differs = ((c.include_code != code and doc.has_code(oa, ob))
+                       or (c.include_images != imgs and doc.has_images(oa, ob)))
+            if differs:
+                msg += (f", returned with {_describe_settings(c)}. To get them with "
+                        f"this selector's settings, request them in a separate call")
+            overlaps.append(msg + ".")
+        remaining = subtract((a, b), [(c.start, c.end) for c in prior])
+        for ra, rb in remaining:
+            pieces.append(Piece(entry, doc, ra, rb, label, (ra, rb) != (a, b), imgs, code))
+            prior.append(Claim(ra, rb, sel_no, label, imgs, code))
+
+    for sel_no, item in enumerate(selectors, 1):
+        if isinstance(item, str):
+            if item.lstrip().startswith("{"):
+                notes.append(f"selector {sel_no}: got a JSON string, not an object; "
+                             f"send selectors as objects, e.g. {{\"doc\": \"auth\"}}")
+                continue
+            sel = Selector(doc=item)
+        else:
+            sel = item if isinstance(item, Selector) else Selector.model_validate(item)
         imgs = include_images if sel.include_images is None else sel.include_images
         code = include_code if sel.include_code is None else sel.include_code
-        targets: list[tuple[DocEntry, list[Range]]] = []
 
         if sel.root is not None:
             try:
-                found = docs_under(index, sel.root)
+                entries = docs_under(index, sel.root)
             except ValueError as e:
-                notes.append(str(e))
+                notes.append(f"selector {sel_no}: {e}")
                 continue
-            if not found:
-                notes.append(f"no documents under root {sel.root!r}")
-            targets = [(e, [(1, -1)]) for e in found]   # -1: through end of file
+            if not entries:
+                notes.append(f"selector {sel_no}: no documents under root {sel.root!r}")
         else:
             entry = index.get(sel.doc)
             if entry is None:
-                notes.append(f"unknown document id {sel.doc!r} (see list_documents)")
+                notes.append(f"selector {sel_no}: unknown document id {sel.doc!r} "
+                             f"(see list_documents)")
                 continue
-            if sel.sections:
-                doc = parse_doc(entry.file)
-                ranges = []
-                for key in sel.sections:
-                    sec, err = find_section(doc, entry.id, key)
-                    if err:
-                        notes.append(err)
-                    else:
-                        ranges.append((sec.start, sec.end))
-                if not ranges:
-                    continue
-                targets = [(entry, ranges)]
-            elif sel.lines:
-                targets = [(entry, [(sel.lines[0], sel.lines[1])])]
-            else:
-                targets = [(entry, [(1, -1)])]
+            entries = [entry]
 
-        for entry, ranges in targets:
+        for entry in entries:
             if not entry.file.is_file():
-                notes.append(f"{entry.id}: file not found at {entry.path}")
+                notes.append(f"selector {sel_no}: {entry.id} file not found at {entry.path}")
                 continue
             doc = parse_doc(entry.file)
             if doc.n == 0:
-                notes.append(f"{entry.id}: document is empty")
+                notes.append(f"selector {sel_no}: {entry.id} is empty")
                 continue
-            clamped = []
-            for a, b in ranges:
-                b = doc.n if b == -1 else b
-                if a > doc.n:
-                    notes.append(f"{entry.id}: L{a}–{b} is past the end of the file ({doc.n} lines)")
-                    continue
-                if b > doc.n:
-                    notes.append(f"{entry.id}: L{a}–{b} clamped to L{a}–{doc.n} (end of file)")
-                    b = doc.n
-                clamped.append((a, b))
-            wanted = merge(clamped)
-            remaining = merge(subtract(wanted, taken.get(entry.id, [])))
-            dropped = subtract(wanted, remaining)
-            if dropped:
-                notes.append(f"{entry.id}: {fmt_ranges(merge(dropped))} already included "
-                             f"earlier in this package, not repeated")
-            for a, b in remaining:
-                pieces.append(Piece(entry, doc, a, b, imgs, code))
-            taken[entry.id] = merge(taken.get(entry.id, []) + remaining)
+            if sel.sections is not None:
+                for key in sel.sections:
+                    sec, err = find_section(doc, entry.id, key)
+                    if err:
+                        notes.append(f"selector {sel_no}: {err}")
+                    else:
+                        add(entry, doc, sec.start, sec.end, f"section {sec.id}",
+                            sel_no, imgs, code)
+            elif sel.lines is not None:
+                a, b = sel.lines
+                add(entry, doc, a, b, f"lines {a}–{b}", sel_no, imgs, code)
+            else:
+                add(entry, doc, 1, doc.n, "full document", sel_no, imgs, code)
 
-    return pieces, notes
+    return pieces, overlaps, notes
 
 
 # --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
 
-def _tidy(text: str) -> str:
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text)
-
-
 def _image_block(img: ImageEntry) -> tuple[ImageContent | None, str | None]:
     if not img.file.is_file():
         return None, "file missing"
-    if IMAGE_INDEX.parent not in img.file.parents:
-        return None, "file outside the images folder"
     if img.file.suffix.lower() not in MIME_TYPES:
         return None, f"unsupported type {img.file.suffix}"
     if img.file.stat().st_size > MAX_IMAGE_BYTES:
@@ -487,11 +490,15 @@ def _image_block(img: ImageEntry) -> tuple[ImageContent | None, str | None]:
 
 def render(piece: Piece, images: dict[str, ImageEntry],
            blocks: list[TextContent | ImageContent]) -> None:
+    """Document lines are emitted exactly as written; only headers,
+    placeholders and fence repairs are added around them."""
     doc, e = piece.doc, piece.entry
-    buf: list[str] = [f"\n=== {e.id} ({e.path}) · {piece.label} · L{piece.start}–{piece.end} ===\n"]
+    part = " (part)" if piece.partial else ""
+    buf: list[str] = [f"\n=== {e.id} ({e.path}) · {piece.label}{part} · "
+                      f"L{piece.start}–{piece.end} ===\n"]
 
     def flush() -> None:
-        text = _tidy("".join(buf))
+        text = "".join(buf)
         if text.strip():
             blocks.append(TextContent(type="text", text=text))
         buf.clear()
@@ -511,8 +518,7 @@ def render(piece: Piece, images: dict[str, ImageEntry],
             else:
                 n_body = max(0, f.end - f.start - (1 if f.closed else 0))
                 buf.append(f"[code block omitted: {f.lang or 'plain'}, "
-                           f"{n_body} line{'' if n_body == 1 else 's'}, "
-                           f"L{f.start}–{f.end}]\n")
+                           f"{n_body} line{'' if n_body == 1 else 's'}, L{f.start}–{f.end}]\n")
             ln = g_end + 1
             continue
 
@@ -551,7 +557,7 @@ def _section_lines(secs: list[Section], indent: str, line_bounds: bool,
     for s in secs:
         bounds = f"  L{s.start}–{s.end}" if line_bounds else ""
         # Full id, so the agent can copy it verbatim into a sections selector.
-        out.append(f"{indent}§ {s.id}  \"{s.title}\"  ~{fmt_tokens(s.tokens)}{bounds}")
+        out.append(f"{indent}§ {s.id}  \"{s.title}\"{bounds}")
         out += _section_lines(s.children, indent + "  ", line_bounds,
                               None if depth_left is None else depth_left - 1)
     return out
@@ -569,38 +575,41 @@ def build_tree(entries: list[DocEntry], root: str) -> dict:
     return tree
 
 
-def _doc_tokens(e: DocEntry) -> int:
-    if e.approx_tokens is not None:
-        return e.approx_tokens
-    return estimate_tokens(e.file.read_text(encoding="utf-8")) if e.file.is_file() else 0
-
-
-def _totals(node: dict) -> tuple[int, int]:
+def _totals(node: dict) -> tuple[int, int, bool]:
+    """(doc count, summed index tokens, whether any doc lacks a token count)."""
     count = len(node["docs"])
-    tokens = sum(_doc_tokens(e) for e in node["docs"])
+    tokens = sum(e.approx_tokens or 0 for e in node["docs"])
+    unknown = any(e.approx_tokens is None for e in node["docs"])
     for child in node["dirs"].values():
-        c, t = _totals(child)
-        count, tokens = count + c, tokens + t
-    return count, tokens
+        c, t, u = _totals(child)
+        count, tokens, unknown = count + c, tokens + t, unknown or u
+    return count, tokens, unknown
+
+
+def _fmt_totals(node: dict) -> str:
+    c, t, unknown = _totals(node)
+    return f"{c} doc{'' if c == 1 else 's'}, ~{t}{'+' if unknown else ''} tokens"
 
 
 def _render_tree(node: dict, indent: str, line_bounds: bool,
                  section_depth: int | None) -> list[str]:
     out = []
     for name, child in sorted(node["dirs"].items()):
-        c, t = _totals(child)
-        out.append(f"{indent}{name}/  ({c} docs, ~{fmt_tokens(t)} tokens)")
+        out.append(f"{indent}{name}/  ({_fmt_totals(child)})")
         out += _render_tree(child, indent + "  ", line_bounds, section_depth)
     for e in node["docs"]:
         fname = PurePosixPath(e.path).name
-        out.append(f"{indent}- {e.id}  [{fname}]  ~{fmt_tokens(_doc_tokens(e))} tokens"
+        tokens = f"~{e.approx_tokens} tokens" if e.approx_tokens is not None else "tokens unknown"
+        out.append(f"{indent}- {e.id}  [{fname}]  {tokens}"
                    f"{f'  — {e.summary}' if e.summary else ''}")
         if not e.file.is_file():
             out.append(f"{indent}    (file not found)")
             continue
+        if section_depth is not None and section_depth <= 0:
+            continue
         doc = parse_doc(e.file)
-        bounds = f", {doc.n} lines" if line_bounds else ""
-        if section_depth != 0 and doc.tree:
+        if doc.tree:
+            bounds = f", {doc.n} lines" if line_bounds else ""
             out.append(f"{indent}    sections{bounds}:")
             out += _section_lines(doc.tree, indent + "      ", line_bounds, section_depth)
     return out
@@ -614,10 +623,10 @@ mcp = MCPServer(
     "library",
     instructions=(
         "Reads an indexed markdown library. Browse with list_documents (a tree with "
-        "summaries, token estimates and section outlines), then request everything "
-        "you need in ONE get_documents call: mix whole docs, directory roots, "
-        "sections and line ranges in a single select list. Leave images off unless "
-        "the visual detail matters."
+        "summaries, token counts and section outlines), then request everything you "
+        "need in ONE get_documents call: mix whole docs, directory roots, sections "
+        "and line ranges in a single select list. Leave images off unless the visual "
+        "detail matters."
     ),
 )
 
@@ -626,8 +635,9 @@ mcp = MCPServer(
 def list_documents(root: str = ".", line_bounds: bool = False,
                    section_depth: int | None = None) -> str:
     """Show the library as a tree starting at `root` (a directory path relative to
-    the library root; "." for everything). Each doc shows its id, summary, approx
-    tokens and its section outline with per-section token estimates.
+    the library root; "." for everything). Each doc shows its id, approx tokens
+    and summary from the library index, and its section outline: each section's
+    full id (use it verbatim in get_documents) and heading text.
 
     line_bounds: also show each section's file line range (L<start>–<end>), for
         use with get_documents line selectors.
@@ -643,9 +653,8 @@ def list_documents(root: str = ".", line_bounds: bool = False,
         tops = sorted({e.path.split("/")[0] for e in index.values()})
         return f"No documents under {root!r}. Top-level entries: {', '.join(tops)}"
     tree = build_tree(entries, r)
-    c, t = _totals(tree)
     head = [
-        f"{r or '.'}/  ({c} docs, ~{fmt_tokens(t)} tokens)",
+        f"{r or '.'}/  ({_fmt_totals(tree)})",
         "Fetch with get_documents: a doc id, {root}, {doc, sections: [...]} or "
         "{doc, lines: [start, end]}. Use section ids exactly as shown after §.",
         "",
@@ -658,47 +667,46 @@ def get_documents(
     select: list[str | Selector],
     include_images: bool = False,
     include_code: bool = True,
-    max_tokens: int | None = DEFAULT_MAX_TOKENS,
 ) -> list[TextContent | ImageContent]:
     """Assemble one package of library content from any mix of selectors, in the
-    order given. Text, code blocks and images are interleaved in document order,
-    and each chunk starts with a header naming its doc, section and line range.
+    order given. Markdown text, fenced code blocks and images are interleaved in
+    document order, and each chunk starts with a header naming its doc, what was
+    selected, and its line range.
 
     select: each item is either a doc id string (the whole doc) or an object with
         exactly one of
           {"doc": id}                          whole doc
-          {"doc": id, "sections": [ids]}       those sections (with subsections)
+          {"doc": id, "sections": [ids]}       those sections, in the order given
           {"doc": id, "lines": [start, end]}   a file line range, inclusive
           {"root": "dir/path"}                 every doc under a directory
         plus optional per-selector include_images / include_code overrides.
-        Content already included earlier in the same call is not repeated.
-    include_images / include_code: defaults for every selector. Omitted images and
-        code blocks are replaced by one-line placeholders.
-    max_tokens: if the estimated package is larger, nothing is returned except a
-        per-piece estimate, so you can narrow the request. null = no limit.
+        If selectors in one call overlap, the overlapping lines are returned
+        once and an overlap notice at the end says where they are. Separate
+        calls are independent and always return everything requested.
+    include_images / include_code: defaults for every selector ("code" means
+        fenced code blocks in the markdown). Omitted images and code blocks are
+        replaced by one-line placeholders.
     """
     index = load_doc_index()
     images = load_image_index()
-    pieces, notes = plan(select, include_images, include_code, index)
-
-    estimates = [p.estimate() for p in pieces]
-    total = sum(estimates)
-    if max_tokens is not None and total > max_tokens:
-        rows = [f"- {p.entry.id} · {p.label} · L{p.start}–{p.end}: ~{fmt_tokens(est)}"
-                for p, est in zip(pieces, estimates)]
-        return [TextContent(type="text", text="\n".join([
-            f"Package not sent: estimated ~{fmt_tokens(total)} tokens exceeds "
-            f"max_tokens={max_tokens}.",
-            "Narrow the selectors, turn off images/code, or raise max_tokens. Estimate by piece:",
-            *rows, *(f"note: {n}" for n in notes)]))]
+    pieces, overlaps, notes = plan(select, include_images, include_code, index)
 
     docs_count = len({p.entry.id for p in pieces})
-    blocks: list[TextContent | ImageContent] = [TextContent(type="text", text=(
-        f"Package: {len(pieces)} pieces from {docs_count} docs, ~{fmt_tokens(total)} tokens"))]
+    summary = f"Package: {len(pieces)} chunks from {docs_count} docs"
+    extras = [f"{len(overlaps)} overlap notice{'' if len(overlaps) == 1 else 's'}"] if overlaps else []
+    extras += [f"{len(notes)} note{'' if len(notes) == 1 else 's'}"] if notes else []
+    if extras:
+        summary += f" ({', '.join(extras)} at the end)"
+
+    blocks: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
     for p in pieces:
         render(p, images, blocks)
+    if overlaps:
+        blocks.append(TextContent(type="text", text="\nOverlap notices:\n"
+                                  + "\n".join(f"- {o}" for o in overlaps)))
     if notes:
-        blocks.append(TextContent(type="text", text="\nNotes:\n" + "\n".join(f"- {n}" for n in notes)))
+        blocks.append(TextContent(type="text", text="\nNotes:\n"
+                                  + "\n".join(f"- {n}" for n in notes)))
     return blocks
 
 
