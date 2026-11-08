@@ -182,3 +182,7 @@ caps heading levels (0 = none).
 > `list_documents`, then fetch everything relevant in ONE `get_documents` call,
 > mixing docs, roots, sections and line ranges as needed. Request images only
 > where the visual detail matters.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
